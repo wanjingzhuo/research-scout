@@ -13,12 +13,14 @@ Configuration is read from a .env file in the current directory:
     MODEL          the model name to use (e.g. gpt-3.5-turbo)
 
 Usage:
-    python research_agent.py            interactive connectivity test
-    python research_agent.py search Q   run search_web(Q) on its own
-    python research_agent.py read URL   run read_webpage(URL) on its own
+    python research_agent.py                 run the research agent loop
+    python research_agent.py search Q        run search_web(Q) on its own
+    python research_agent.py read URL        run read_webpage(URL) on its own
+    python research_agent.py test-connection run the prompt-1 connectivity test
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -39,6 +41,12 @@ REQUEST_TIMEOUT = 60
 
 # How many times we are allowed to retry after the initial attempt.
 MAX_RETRIES = 3
+
+# The agent gets at most this many SEARCH/READ/FINISH steps per run. This is
+# the single source of truth: the loop bound below and the number the model
+# is told in its instructions both come from this constant, so they can
+# never drift apart.
+STEP_LIMIT = 6
 
 # A browser-style User-Agent. Some services return 403 (error code 1010)
 # and refuse the request unless one is sent.
@@ -188,7 +196,18 @@ def _parse_retry_after(response):
 # =============================================================================
 
 def call_chat_completions(base_url, model, prompt, api_key):
-    """Send a chat completions request and return the reply text.
+    """Send a single user-message chat completions request and return the
+    reply text. Thin wrapper around call_chat_completions_messages() for
+    callers that just have one prompt string (e.g. the prompt-1
+    connectivity test)."""
+    return call_chat_completions_messages(
+        base_url, model, [{"role": "user", "content": prompt}], api_key
+    )
+
+
+def call_chat_completions_messages(base_url, model, messages, api_key):
+    """Send a chat completions request with an explicit messages list (e.g.
+    a system prompt plus a user message) and return the reply text.
 
     Retries on 429 (rate limited, honoring Retry-After) and 5xx (server
     errors, fixed 2s wait), up to MAX_RETRIES times each. Returns None if no
@@ -203,7 +222,7 @@ def call_chat_completions(base_url, model, prompt, api_key):
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
     }
 
     retries_used = 0
@@ -283,6 +302,176 @@ def _extract_content(response):
 
 
 # =============================================================================
+# Agent loop
+# =============================================================================
+
+def build_agent_instructions():
+    """The system prompt sent on every agent step: what the three tools do,
+    the step limit, the required JSON reply shape, and the FINISH report
+    structure. STEP_LIMIT is interpolated in, not hardcoded, so the number
+    the model is told always matches the number the loop actually enforces.
+    """
+    return f"""You are a research agent. You have three actions:
+
+SEARCH: search the web. Reply with:
+  {{"reason": "one short sentence", "action": "SEARCH", "query": "..."}}
+
+READ: read one web page. Reply with:
+  {{"reason": "one short sentence", "action": "READ", "url": "..."}}
+
+FINISH: you have enough information to answer the goal. Reply with:
+  {{"reason": "one short sentence", "action": "FINISH", "report": "..."}}
+
+You have at most {STEP_LIMIT} steps total in this run, including this one.
+If you have not FINISHed by step {STEP_LIMIT}, the run ends without a report,
+so budget your steps.
+
+Web page text returned by READ is often full of navigation, menus, and
+boilerplate — do not assume it is clean; look past it for the actual
+content.
+
+A failed SEARCH or a page that will not load is a normal outcome, not a
+reason to give up — read the observation on the next step and try a
+different query or URL.
+
+When you FINISH, write "report" as a research brief with exactly these
+five sections, in this order, each starting with its label on its own line:
+
+Question: <the research question>
+Findings: <what you learned, citing where each finding came from>
+Comparison: <how the findings compare or relate to each other>
+Recommendation: <your recommendation or conclusion>
+Sources: <the URLs you actually read>
+
+Reply with ONLY a JSON object, nothing else. No markdown, no explanation,
+no code fences.
+"""
+
+
+def ask_agent_model(goal, state, base_url, model, api_key):
+    """Ask the model for its next action, given the goal and everything
+    that has happened so far. Returns the raw reply text, or None if no
+    reply could be obtained (an explanatory message has already been
+    printed by call_chat_completions_messages in that case)."""
+    messages = [
+        {"role": "system", "content": build_agent_instructions()},
+        {
+            "role": "user",
+            "content": f"Goal: {goal}\n\nState so far (JSON):\n{json.dumps(state, indent=2)}",
+        },
+    ]
+    return call_chat_completions_messages(base_url, model, messages, api_key)
+
+
+def parse_agent_decision(raw_reply):
+    """Parse the model's reply as a JSON object, stripping markdown code
+    fences first if present. Returns the parsed dict, or None if parsing
+    still fails — in which case the raw reply and a clear message have
+    already been printed. Unlike a failed SEARCH/READ, unparseable JSON is
+    not recoverable: the caller is expected to stop the program."""
+    cleaned = raw_reply.strip()
+    cleaned = cleaned.removeprefix("```json").removeprefix("```")
+    cleaned = cleaned.removesuffix("```").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        print("The model's reply was not valid JSON.")
+        print(f"  error: {exc}")
+        print("Raw reply:")
+        print(raw_reply)
+        return None
+
+
+def summarize_search_results(results):
+    """One-line summary of a search_web() result, for the per-step log."""
+    if not results:
+        return "no results"
+    titles = "; ".join(r["title"] for r in results[:3])
+    if len(results) > 3:
+        titles += f"; (+{len(results) - 3} more)"
+    return f"{len(results)} result(s): {titles}"
+
+
+def summarize_read_result(text, limit=150):
+    """One-line summary of a read_webpage() result, for the per-step log."""
+    if text.startswith("[failed to read:"):
+        return text
+    snippet = text[:limit].replace("\n", " ")
+    if len(text) > limit:
+        snippet += "..."
+    return f"{len(text)} char(s): {snippet}"
+
+
+def print_research_brief(report):
+    print()
+    print("=== RESEARCH BRIEF ===")
+    print(report if report else "(the model returned an empty report)")
+
+
+def run_agent(goal, base_url, api_key, model):
+    """Run the SEARCH/READ/FINISH loop for at most STEP_LIMIT steps.
+
+    Every failure during the run — a failed SEARCH, a page that will not
+    load, an unparseable reply, or a total API failure after
+    call_chat_completions_messages exhausts its own retries — is recovered
+    the same way: recorded as an entry in state and the loop continues, so
+    a single failure never throws away everything gathered so far. STEP_LIMIT
+    is what bounds the total cost of that; the only thing that stops the
+    whole program outright is a configuration problem that could never have
+    succeeded in the first place (missing .env settings, checked once before
+    the loop even starts).
+    """
+    state = []
+
+    for step in range(1, STEP_LIMIT + 1):
+        raw_reply = ask_agent_model(goal, state, base_url, model, api_key)
+        if raw_reply is None:
+            print(f"STEP {step}/{STEP_LIMIT}: no reply was obtained from the API — recorded as an error, retrying next step.")
+            state.append({"action": "ERROR", "detail": "API call failed after retries exhausted"})
+            continue
+
+        decision = parse_agent_decision(raw_reply)
+        if decision is None:
+            print(f"STEP {step}/{STEP_LIMIT}: the model's reply could not be parsed as JSON — recorded as an error, retrying next step.")
+            state.append({"action": "ERROR", "detail": f"unparseable JSON reply: {raw_reply}"})
+            continue
+
+        reason = decision.get("reason", "")
+        action = decision.get("action")
+
+        if action == "SEARCH":
+            query = decision.get("query", "")
+            print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
+            print(f"  action: SEARCH {query!r}")
+            results = search_web(query)
+            print(f"  observation: {summarize_search_results(results)}")
+            state.append({"action": "SEARCH", "query": query, "result": results})
+
+        elif action == "READ":
+            url = decision.get("url", "")
+            print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
+            print(f"  action: READ {url!r}")
+            text = read_webpage(url)
+            print(f"  observation: {summarize_read_result(text)}")
+            state.append({"action": "READ", "url": url, "result": text})
+
+        elif action == "FINISH":
+            report = decision.get("report", "")
+            print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
+            print("  action: FINISH")
+            print_research_brief(report)
+            return state, report
+
+        else:
+            print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
+            print(f"  action: unrecognized ({decision!r})")
+            state.append({"action": "ERROR", "detail": f"unrecognized action: {decision!r}"})
+
+    print(f"\nStep limit ({STEP_LIMIT}) reached before FINISH. No report was produced.")
+    return state, None
+
+
+# =============================================================================
 # CLI entry point
 # =============================================================================
 
@@ -305,10 +494,12 @@ def build_connectivity_test_prompt(question):
     )
 
 
-def run_interactive():
-    """Ask for a question and run the prompt-1 connectivity test."""
-    print("Research Agent")
-    print("--------------")
+def run_connectivity_test_command():
+    """Ask for a question and run the prompt-1 connectivity test (checkpoint
+    1 verification: proves the API call chain works, without the model
+    actually researching anything)."""
+    print("Research Agent — connectivity test")
+    print("-----------------------------------")
 
     base_url, api_key, model = load_settings()
 
@@ -334,6 +525,29 @@ def run_interactive():
     print(reply)
 
 
+def run_agent_interactive():
+    """Ask for a research goal and run the full SEARCH/READ/FINISH agent
+    loop on it (checkpoint 3: the tool-using agent)."""
+    print("Research Agent")
+    print("--------------")
+
+    base_url, api_key, model = load_settings()
+
+    try:
+        goal = input("Enter a research question: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nNo question entered. Goodbye.")
+        sys.exit(0)
+
+    if not goal:
+        print("You did not enter a question. Nothing to do.")
+        sys.exit(0)
+
+    print(f"\nGoal: {goal}\n")
+
+    run_agent(goal, base_url, api_key, model)
+
+
 def run_search_command(query):
     """Run search_web(query) on its own and print the results. On failure
     search_web already returns a single result explaining why (see its
@@ -354,8 +568,8 @@ def run_read_command(url):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Research agent: interactive connectivity test, or "
-        "standalone tool testing via subcommands."
+        description="Research agent: runs the SEARCH/READ/FINISH agent loop "
+        "by default, or a standalone check via subcommands."
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -365,14 +579,21 @@ def main():
     read_parser = subparsers.add_parser("read", help="run read_webpage(url) on its own")
     read_parser.add_argument("url", help="the page URL to fetch")
 
+    subparsers.add_parser(
+        "test-connection",
+        help="checkpoint 1: verify the API call chain works, without researching",
+    )
+
     args = parser.parse_args()
 
     if args.command == "search":
         run_search_command(args.query)
     elif args.command == "read":
         run_read_command(args.url)
+    elif args.command == "test-connection":
+        run_connectivity_test_command()
     else:
-        run_interactive()
+        run_agent_interactive()
 
 
 if __name__ == "__main__":

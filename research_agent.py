@@ -14,6 +14,7 @@ Configuration is read from a .env file in the current directory:
 
 Usage:
     python research_agent.py                 run the research agent loop
+    python research_agent.py --eval           run the loop, then evaluate the run
     python research_agent.py search Q        run search_web(Q) on its own
     python research_agent.py read URL        run read_webpage(URL) on its own
     python research_agent.py test-connection run the prompt-1 connectivity test
@@ -22,6 +23,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from email.utils import parsedate_to_datetime
@@ -472,6 +474,75 @@ def run_agent(goal, base_url, api_key, model):
 
 
 # =============================================================================
+# Evaluation mode
+# =============================================================================
+
+REPORT_SECTION_LABELS = ["Question", "Findings", "Comparison", "Recommendation", "Sources"]
+URL_PATTERN = re.compile(r"https?://\S+")
+
+
+def parse_report_sections(report):
+    """Split a FINISH report into its five labeled sections (Question,
+    Findings, Comparison, Recommendation, Sources), each stripped of
+    surrounding whitespace. A label that never appears, or a missing/empty
+    report, maps to "" — callers don't need to special-case None."""
+    sections = {label: "" for label in REPORT_SECTION_LABELS}
+    if not report:
+        return sections
+
+    positions = []
+    for label in REPORT_SECTION_LABELS:
+        match = re.search(rf"(?m)^{label}:", report)
+        if match:
+            positions.append((match.start(), label))
+    positions.sort()
+
+    for i, (start, label) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(report)
+        content_start = start + len(label) + 1  # skip "Label:"
+        sections[label] = report[content_start:end].strip()
+    return sections
+
+
+def run_evals(state, report):
+    """Check five things about a completed run. Every check reads `state`
+    (what actually happened) and `report` (what was actually printed) —
+    never the model's own claim about how the run went."""
+    checks = []
+
+    used_search = any(s.get("action") == "SEARCH" for s in state)
+    checks.append(("Used the search tool at least once", used_search))
+
+    valid_read_urls = {
+        s["url"] for s in state
+        if s.get("action") == "READ" and not s.get("result", "").startswith("[failed to read:")
+    }
+    checks.append(("Consulted more than one distinct source", len(valid_read_urls) > 1))
+
+    checks.append(("Stayed within the step limit", report is not None))
+
+    sections = parse_report_sections(report)
+    checks.append(("Brief contains a recommendation", bool(sections["Recommendation"])))
+
+    source_urls = {u.rstrip(".,;)]}\"'") for u in URL_PATTERN.findall(sections["Sources"])}
+    checks.append(("Brief lists at least three sources", len(source_urls) >= 3))
+
+    print("\n--- EVAL RESULTS ---")
+    passed = 0
+    for name, ok in checks:
+        status = "PASS" if ok else "FAIL"
+        if ok:
+            passed += 1
+        print(f"{status}  {name}")
+    print(f"\nScore: {passed} of {len(checks)}")
+
+    return {
+        "checks": [{"name": name, "passed": ok} for name, ok in checks],
+        "score": f"{passed} of {len(checks)}",
+    }
+
+
+# =============================================================================
 # CLI entry point
 # =============================================================================
 
@@ -525,9 +596,11 @@ def run_connectivity_test_command():
     print(reply)
 
 
-def run_agent_interactive():
+def run_agent_interactive(eval_mode=False):
     """Ask for a research goal and run the full SEARCH/READ/FINISH agent
-    loop on it (checkpoint 3: the tool-using agent)."""
+    loop on it (checkpoint 3: the tool-using agent). If eval_mode is set,
+    also run the five checks from run_evals() on the completed run
+    (checkpoint 5)."""
     print("Research Agent")
     print("--------------")
 
@@ -545,7 +618,10 @@ def run_agent_interactive():
 
     print(f"\nGoal: {goal}\n")
 
-    run_agent(goal, base_url, api_key, model)
+    state, report = run_agent(goal, base_url, api_key, model)
+
+    if eval_mode:
+        run_evals(state, report)
 
 
 def run_search_command(query):
@@ -584,6 +660,13 @@ def main():
         help="checkpoint 1: verify the API call chain works, without researching",
     )
 
+    parser.add_argument(
+        "--eval",
+        action="store_true",
+        help="after the agent loop finishes, run the five checks from run_evals() "
+        "on the completed run and print PASS/FAIL plus a total score",
+    )
+
     args = parser.parse_args()
 
     if args.command == "search":
@@ -593,7 +676,7 @@ def main():
     elif args.command == "test-connection":
         run_connectivity_test_command()
     else:
-        run_agent_interactive()
+        run_agent_interactive(eval_mode=args.eval)
 
 
 if __name__ == "__main__":

@@ -13,15 +13,20 @@ Configuration is read from a .env file in the current directory:
     MODEL          the model name to use (e.g. gpt-3.5-turbo)
 
 Usage:
-    python research_agent.py
+    python research_agent.py            interactive connectivity test
+    python research_agent.py search Q   run search_web(Q) on its own
+    python research_agent.py read URL   run read_webpage(URL) on its own
 """
 
+import argparse
 import os
 import sys
 import time
 from email.utils import parsedate_to_datetime
 
 import requests
+from bs4 import BeautifulSoup
+from ddgs import DDGS
 from dotenv import load_dotenv
 
 
@@ -68,6 +73,68 @@ def load_settings():
     api_key = os.getenv("API_KEY").strip()
     model = os.getenv("MODEL").strip()
     return base_url, api_key, model
+
+
+# =============================================================================
+# Tools: search_web / read_webpage
+# =============================================================================
+
+MAX_SEARCH_RESULTS = 5
+READ_TEXT_LIMIT = 2000
+
+
+def search_web(query):
+    """search_web(query): searches the web for `query` and returns up to 5
+    results, each with a title, url, and snippet — call this to discover
+    pages that might help answer the research question. On failure, returns
+    a single-item list whose snippet explains what went wrong, instead of
+    silently returning nothing."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=MAX_SEARCH_RESULTS))
+    except Exception as exc:
+        print(f"Search failed: {type(exc).__name__}: {exc}")
+        print(f"  query: {query}")
+        return [{"title": "[search failed]", "url": "", "snippet": f"[search failed: {exc}]"}]
+
+    return [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("href", ""),
+            "snippet": r.get("body", ""),
+        }
+        for r in results
+    ]
+
+
+def read_webpage(url):
+    """read_webpage(url): fetches the page at `url` and returns its visible
+    text, up to 2000 characters — call this to read the full content of one
+    specific page, e.g. a URL returned by search_web. On failure, returns a
+    string starting with "[failed to read:" explaining why, instead of an
+    empty string — check for that prefix to tell a real read from a failed
+    one."""
+    try:
+        response = requests.get(
+            url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
+        )
+    except requests.exceptions.RequestException as exc:
+        print(f"Page fetch failed: {type(exc).__name__}: {exc}")
+        print(f"  url: {url}")
+        return f"[failed to read: {exc}]"
+
+    if not response.ok:
+        print(f"Page fetch failed: HTTP {response.status_code}")
+        print(f"  url: {url}")
+        return f"[failed to read: HTTP {response.status_code} {response.reason}]"
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+    if not text:
+        print("Page fetch failed: page returned no readable text")
+        print(f"  url: {url}")
+        return "[failed to read: page returned no readable text]"
+    return text[:READ_TEXT_LIMIT]
 
 
 # =============================================================================
@@ -238,7 +305,8 @@ def build_connectivity_test_prompt(question):
     )
 
 
-def main():
+def run_interactive():
+    """Ask for a question and run the prompt-1 connectivity test."""
     print("Research Agent")
     print("--------------")
 
@@ -264,6 +332,47 @@ def main():
 
     print("Model reply (proves the API call chain works — not a research answer):")
     print(reply)
+
+
+def run_search_command(query):
+    """Run search_web(query) on its own and print the results. On failure
+    search_web already returns a single result explaining why (see its
+    docstring), so there is nothing extra to handle here."""
+    results = search_web(query)
+    for i, r in enumerate(results, start=1):
+        print(f"{i}. {r['title']}")
+        print(f"   {r['url']}")
+        print(f"   {r['snippet']}")
+
+
+def run_read_command(url):
+    """Run read_webpage(url) on its own and print the extracted text. On
+    failure read_webpage already returns a "[failed to read: ...]" string
+    explaining why, so there is nothing extra to handle here."""
+    print(read_webpage(url))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Research agent: interactive connectivity test, or "
+        "standalone tool testing via subcommands."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    search_parser = subparsers.add_parser("search", help="run search_web(query) on its own")
+    search_parser.add_argument("query", help="the search query")
+
+    read_parser = subparsers.add_parser("read", help="run read_webpage(url) on its own")
+    read_parser.add_argument("url", help="the page URL to fetch")
+
+    args = parser.parse_args()
+
+    if args.command == "search":
+        run_search_command(args.query)
+    elif args.command == "read":
+        run_read_command(args.url)
+    else:
+        run_interactive()
 
 
 if __name__ == "__main__":

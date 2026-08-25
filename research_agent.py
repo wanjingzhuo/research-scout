@@ -48,7 +48,12 @@ MAX_RETRIES = 3
 # the single source of truth: the loop bound below and the number the model
 # is told in its instructions both come from this constant, so they can
 # never drift apart.
-STEP_LIMIT = 6
+STEP_LIMIT = 8
+
+# FINISH is refused until at least this many distinct pages have been read
+# successfully. Also the single source of truth: enforced by the loop and
+# stated in the model's instructions from the same constant.
+MIN_PAGES_READ = 3
 
 # A browser-style User-Agent. Some services return 403 (error code 1010)
 # and refuse the request unless one is sent.
@@ -90,7 +95,7 @@ def load_settings():
 # =============================================================================
 
 MAX_SEARCH_RESULTS = 5
-READ_TEXT_LIMIT = 2000
+READ_TEXT_LIMIT = 5000
 
 
 def search_web(query):
@@ -119,7 +124,7 @@ def search_web(query):
 
 def read_webpage(url):
     """read_webpage(url): fetches the page at `url` and returns its visible
-    text, up to 2000 characters — call this to read the full content of one
+    text, up to 5000 characters — call this to read the full content of one
     specific page, e.g. a URL returned by search_web. On failure, returns a
     string starting with "[failed to read:" explaining why, instead of an
     empty string — check for that prefix to tell a real read from a failed
@@ -310,19 +315,29 @@ def _extract_content(response):
 def build_agent_instructions():
     """The system prompt sent on every agent step: what the three tools do,
     the step limit, the required JSON reply shape, and the FINISH report
-    structure. STEP_LIMIT is interpolated in, not hardcoded, so the number
-    the model is told always matches the number the loop actually enforces.
+    structure. STEP_LIMIT and MIN_PAGES_READ are interpolated in, not
+    hardcoded, so the numbers the model is told always match what the loop
+    actually enforces.
     """
     return f"""You are a research agent. You have three actions:
 
-SEARCH: search the web. Reply with:
-  {{"reason": "one short sentence", "action": "SEARCH", "query": "..."}}
+SEARCH  Search the web for information relevant to the goal. Reply with:
+        {{"reason": "one short sentence", "action": "SEARCH", "query": "..."}}
 
-READ: read one web page. Reply with:
-  {{"reason": "one short sentence", "action": "READ", "url": "..."}}
+READ    Read the full text of one specific web page (e.g. a URL from a
+        SEARCH result). Reply with:
+        {{"reason": "one short sentence", "action": "READ", "url": "..."}}
 
-FINISH: you have enough information to answer the goal. Reply with:
-  {{"reason": "one short sentence", "action": "FINISH", "report": "..."}}
+FINISH  Write the report. Only choose this after you have read at least three
+        different web pages. Base the report on the text of those pages. Search
+        result titles and snippets are not enough on their own. Price tickers,
+        shop pages and product listings give you a number but no explanation, so
+        prefer news articles, analysis and official sources when you choose what
+        to read. Reply with:
+        {{"reason": "one short sentence", "action": "FINISH", "report": "..."}}
+
+Reply with ONLY a JSON object, nothing else. No markdown, no explanation,
+no code fences.
 
 You have at most {STEP_LIMIT} steps total in this run, including this one.
 If you have not FINISHed by step {STEP_LIMIT}, the run ends without a report,
@@ -334,19 +349,28 @@ content.
 
 A failed SEARCH or a page that will not load is a normal outcome, not a
 reason to give up — read the observation on the next step and try a
-different query or URL.
+different query or URL. You cannot READ the same URL twice: asking again is
+refused and wastes a step, so pick a different page.
 
-When you FINISH, write "report" as a research brief with exactly these
-five sections, in this order, each starting with its label on its own line:
+If you choose FINISH having read fewer than {MIN_PAGES_READ} different pages
+successfully, or with an empty report, it is refused: you will see a note in
+the state saying how many pages you have actually read and that you should
+READ more before trying FINISH again.
+
+When you FINISH, write "report" with exactly these four sections, in this
+order, each starting with its label on its own line:
 
 Question: <the research question>
-Findings: <what you learned, citing where each finding came from>
+Findings: <what you learned. Each individual finding must end with the URL
+    it came from, in square brackets, like this: [https://example.com/page].
+    Only cite a URL you actually used READ on — never one you only saw in a
+    SEARCH result. If a finding comes from what you already knew rather than
+    from a page you read, end it with [no source] instead.>
 Comparison: <how the findings compare or relate to each other>
 Recommendation: <your recommendation or conclusion>
-Sources: <the URLs you actually read>
 
-Reply with ONLY a JSON object, nothing else. No markdown, no explanation,
-no code fences.
+Do not write your own sources list — the program adds one automatically from
+the pages you actually read.
 """
 
 
@@ -404,24 +428,69 @@ def summarize_read_result(text, limit=150):
     return f"{len(text)} char(s): {snippet}"
 
 
-def print_research_brief(report):
+def format_source_lists(state):
+    """Build the two honest source lists straight from state — the ground
+    truth of what actually happened — not anything the model claims in its
+    report text. Neither list contains repeats. A page that failed to load
+    is excluded from both: it was attempted, so it is not "also found"
+    either.
+    """
+    pages_read = []
+    seen_read = set()
+    attempted_urls = set()
+
+    for entry in state:
+        if entry.get("action") != "READ":
+            continue
+        url = entry.get("url", "")
+        if not url:
+            continue
+        attempted_urls.add(url)
+        result = entry.get("result", "")
+        if not result.startswith("[failed to read:") and url not in seen_read:
+            pages_read.append(url)
+            seen_read.add(url)
+
+    also_found = []
+    seen_found = set()
+    for entry in state:
+        if entry.get("action") != "SEARCH":
+            continue
+        for r in entry.get("result", []):
+            url = r.get("url", "")
+            if url and url not in attempted_urls and url not in seen_found:
+                also_found.append(url)
+                seen_found.add(url)
+
+    lines = ["Pages read:"]
+    lines += [f"- {u}" for u in pages_read] if pages_read else ["(none)"]
+    lines.append("")
+    lines.append("Also found:")
+    lines += [f"- {u}" for u in also_found] if also_found else ["(none)"]
+    return "\n".join(lines)
+
+
+def print_research_brief(report, state):
     print()
     print("=== RESEARCH BRIEF ===")
     print(report if report else "(the model returned an empty report)")
+    print()
+    print(format_source_lists(state))
 
 
 def run_agent(goal, base_url, api_key, model):
     """Run the SEARCH/READ/FINISH loop for at most STEP_LIMIT steps.
 
     Every failure during the run — a failed SEARCH, a page that will not
-    load, an unparseable reply, or a total API failure after
-    call_chat_completions_messages exhausts its own retries — is recovered
-    the same way: recorded as an entry in state and the loop continues, so
-    a single failure never throws away everything gathered so far. STEP_LIMIT
-    is what bounds the total cost of that; the only thing that stops the
-    whole program outright is a configuration problem that could never have
-    succeeded in the first place (missing .env settings, checked once before
-    the loop even starts).
+    load, an unparseable reply, a total API failure after
+    call_chat_completions_messages exhausts its own retries, a duplicate
+    READ, or a FINISH refused for reading too few pages / an empty report —
+    is recovered the same way: recorded as an entry in state and the loop
+    continues, so a single failure never throws away everything gathered so
+    far. STEP_LIMIT is what bounds the total cost of that; the only thing
+    that stops the whole program outright is a configuration problem that
+    could never have succeeded in the first place (missing .env settings,
+    checked once before the loop even starts).
     """
     state = []
 
@@ -452,6 +521,17 @@ def run_agent(goal, base_url, api_key, model):
         elif action == "READ":
             url = decision.get("url", "")
             print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
+
+            already_attempted = {s["url"] for s in state if s.get("action") == "READ"}
+            if url in already_attempted:
+                print(f"  action: READ refused — {url!r} was already read this run.")
+                state.append({
+                    "action": "READ_REFUSED",
+                    "url": url,
+                    "detail": "this URL was already read earlier in this run; choose a different one",
+                })
+                continue
+
             print(f"  action: READ {url!r}")
             text = read_webpage(url)
             print(f"  observation: {summarize_read_result(text)}")
@@ -460,8 +540,36 @@ def run_agent(goal, base_url, api_key, model):
         elif action == "FINISH":
             report = decision.get("report", "")
             print(f"STEP {step}/{STEP_LIMIT}: reason: {reason}")
-            print("  action: FINISH")
-            print_research_brief(report)
+
+            if not report.strip():
+                print("  action: FINISH refused — the report was empty.")
+                state.append({
+                    "action": "FINISH_REFUSED",
+                    "detail": "the report was empty; choose READ or SEARCH next",
+                })
+                continue
+
+            valid_read_urls = {
+                s["url"] for s in state
+                if s.get("action") == "READ" and not s.get("result", "").startswith("[failed to read:")
+            }
+            pages_read = len(valid_read_urls)
+            if pages_read < MIN_PAGES_READ:
+                print(
+                    f"  action: FINISH refused — only {pages_read} distinct page(s) "
+                    f"read successfully, {MIN_PAGES_READ} required."
+                )
+                state.append({
+                    "action": "FINISH_REFUSED",
+                    "detail": (
+                        f"only {pages_read} distinct page(s) read successfully; "
+                        f"{MIN_PAGES_READ} are required before FINISH is accepted; choose READ next"
+                    ),
+                })
+                continue
+
+            print("  action: FINISH accepted")
+            print_research_brief(report, state)
             return state, report
 
         else:
@@ -477,15 +585,17 @@ def run_agent(goal, base_url, api_key, model):
 # Evaluation mode
 # =============================================================================
 
-REPORT_SECTION_LABELS = ["Question", "Findings", "Comparison", "Recommendation", "Sources"]
-URL_PATTERN = re.compile(r"https?://\S+")
+REPORT_SECTION_LABELS = ["Question", "Findings", "Comparison", "Recommendation"]
 
 
 def parse_report_sections(report):
-    """Split a FINISH report into its five labeled sections (Question,
-    Findings, Comparison, Recommendation, Sources), each stripped of
-    surrounding whitespace. A label that never appears, or a missing/empty
-    report, maps to "" — callers don't need to special-case None."""
+    """Split a FINISH report into its four model-authored labeled sections
+    (Question, Findings, Comparison, Recommendation), each stripped of
+    surrounding whitespace. The source lists are not among these — they are
+    appended separately by format_source_lists(), built from state rather
+    than trusted from the model's text. A label that never appears, or a
+    missing/empty report, maps to "" — callers don't need to special-case
+    None."""
     sections = {label: "" for label in REPORT_SECTION_LABELS}
     if not report:
         return sections
@@ -524,8 +634,11 @@ def run_evals(state, report):
     sections = parse_report_sections(report)
     checks.append(("Brief contains a recommendation", bool(sections["Recommendation"])))
 
-    source_urls = {u.rstrip(".,;)]}\"'") for u in URL_PATTERN.findall(sections["Sources"])}
-    checks.append(("Brief lists at least three sources", len(source_urls) >= 3))
+    # The printed brief's "Pages read" list is built from this same
+    # valid_read_urls set (see format_source_lists) rather than parsed back
+    # out of text, so checking it here directly is the honest equivalent of
+    # checking the brief's source list.
+    checks.append(("Brief lists at least three sources", len(valid_read_urls) >= 3))
 
     print("\n--- EVAL RESULTS ---")
     passed = 0
